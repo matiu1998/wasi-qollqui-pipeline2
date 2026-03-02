@@ -18,6 +18,7 @@ jobs:
       REGION: us-central1
       BUCKET: wasi-qollqui-lake-53930c9b
       DATASET: wasi_qollqui
+      SA_EMAIL: github-actions-sa@project-53930c9b-4e21-4329-b74.iam.gserviceaccount.com
 
     steps:
       - name: Checkout repository
@@ -44,6 +45,7 @@ jobs:
           gcloud dataproc batches submit pyspark gs://${BUCKET}/code/pipeline_wasi_qollqui.py \
             --region=${REGION} \
             --version=2.2 \
+            --service-account=${{ env.SA_EMAIL }} \
             --properties=spark.wasi.bucket=${BUCKET}
 
       - name: Materialize BI table in BigQuery
