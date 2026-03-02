@@ -1,5 +1,6 @@
 # src/pipeline_wasi_qollqui.py
-# Wasi Qollqui - Spark Serverless (Dataproc) - Medallion (Bronze CSV -> Silver Parquet -> Gold Parquet + BigQuery)
+# Wasi Qollqui - Spark Serverless (Dataproc) - Medallion (Bronze CSV -> Silver Parquet -> Gold Parquet)
+# Arquitectura: GCS (Parquet) + BigQuery External (creado en workflow) + tabla BI materializada (workflow).
 # Compatible con Dataproc Serverless (Spark) sin Delta.
 
 import os
@@ -16,12 +17,11 @@ spark = (
     .appName("wasi-qollqui-medallion-parquet")
     .getOrCreate()
 )
-
 spark.sparkContext.setLogLevel("INFO")
 
 
 # =========================
-# Config (desde Spark conf / env)
+# Config (Spark conf / env)
 # =========================
 def _get_env_any(keys: List[str], default: str = "") -> str:
     for k in keys:
@@ -35,13 +35,11 @@ BUCKET = spark.conf.get("spark.wasi.bucket", "")
 if not BUCKET:
     raise ValueError("Falta spark.wasi.bucket. Pásalo en el job con --properties=spark.wasi.bucket=TU_BUCKET")
 
-# Proyecto/dataset: intentamos inferirlos del entorno (GitHub Actions / GCP) y si no, usamos defaults.
 PROJECT_ID = spark.conf.get(
     "spark.wasi.project",
     _get_env_any(["GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT", "CLOUDSDK_CORE_PROJECT"], default="")
 )
-
-DATASET = spark.conf.get("spark.wasi.dataset", "wasi_qollqui")  # default por tu arquitectura
+DATASET = spark.conf.get("spark.wasi.dataset", "wasi_qollqui")
 BQ_LOCATION = spark.conf.get("spark.wasi.bq_location", "us-central1")
 
 # Paths Medallion
@@ -49,7 +47,7 @@ BRONZE = f"gs://{BUCKET}/bronze/csv"
 SILVER = f"gs://{BUCKET}/silver/parquet"
 GOLD = f"gs://{BUCKET}/gold/parquet"
 
-# Tablas esperadas (nombres de archivo)
+# Tablas (nombres de archivo)
 TABLES = ["clientes", "deuda", "pagos", "gestiones_cobranza", "productos", "promesas_pago"]
 
 
@@ -57,12 +55,7 @@ TABLES = ["clientes", "deuda", "pagos", "gestiones_cobranza", "productos", "prom
 # Utils
 # =========================
 def normalize_cols(df: DataFrame) -> DataFrame:
-    """
-    Normaliza columnas:
-    - strip
-    - lowercase
-    - espacios -> _
-    """
+    """Normaliza columnas: strip, lowercase, espacios -> _"""
     for c in df.columns:
         new_c = c.strip().lower().replace(" ", "_")
         if new_c != c:
@@ -71,6 +64,7 @@ def normalize_cols(df: DataFrame) -> DataFrame:
 
 
 def read_csv_bronze(name: str, schema: T.StructType) -> DataFrame:
+    """Lee CSV desde Bronze en GCS."""
     path = f"{BRONZE}/{name}.csv"
     df = (
         spark.read
@@ -82,6 +76,7 @@ def read_csv_bronze(name: str, schema: T.StructType) -> DataFrame:
 
 
 def write_parquet(df: DataFrame, path: str) -> None:
+    """Escribe Parquet overwrite."""
     (
         df.write
         .mode("overwrite")
@@ -90,11 +85,25 @@ def write_parquet(df: DataFrame, path: str) -> None:
 
 
 def safe_div(numer_col, denom_col):
+    """División segura (evita /0)."""
     return F.when(denom_col.isNull() | (denom_col == 0), F.lit(None)).otherwise(numer_col / denom_col)
 
 
+def to_date_multi(col_name: str) -> F.Column:
+    """
+    Intenta parsear fecha con varios formatos comunes.
+    Ajusta si tu data usa formatos distintos.
+    """
+    return F.coalesce(
+        F.to_date(F.col(col_name), "yyyy-MM-dd"),
+        F.to_date(F.col(col_name), "dd/MM/yyyy"),
+        F.to_date(F.col(col_name), "MM/dd/yyyy"),
+        F.to_date(F.col(col_name))  # fallback
+    )
+
+
 # =========================
-# Schemas (para estabilidad)
+# Schemas (estables)
 # =========================
 schemas: Dict[str, T.StructType] = {
     "clientes": T.StructType([
@@ -103,14 +112,14 @@ schemas: Dict[str, T.StructType] = {
         T.StructField("nombre", T.StringType(), True),
         T.StructField("telefono", T.StringType(), True),
         T.StructField("direccion", T.StringType(), True),
-        T.StructField("fecha_registro", T.StringType(), True),  # parse luego
+        T.StructField("fecha_registro", T.StringType(), True),
     ]),
     "deuda": T.StructType([
         T.StructField("debt_id", T.LongType(), True),
         T.StructField("customer_id", T.LongType(), True),
         T.StructField("product_id", T.LongType(), True),
         T.StructField("monto_deuda", T.DoubleType(), True),
-        T.StructField("fecha_vencimiento", T.StringType(), True),  # parse luego
+        T.StructField("fecha_vencimiento", T.StringType(), True),
         T.StructField("estado", T.StringType(), True),
     ]),
     "pagos": T.StructType([
@@ -118,14 +127,14 @@ schemas: Dict[str, T.StructType] = {
         T.StructField("debt_id", T.LongType(), True),
         T.StructField("customer_id", T.LongType(), True),
         T.StructField("monto_pago", T.DoubleType(), True),
-        T.StructField("fecha_pago", T.StringType(), True),  # parse luego
+        T.StructField("fecha_pago", T.StringType(), True),
     ]),
     "gestiones_cobranza": T.StructType([
         T.StructField("gestion_id", T.LongType(), True),
         T.StructField("customer_id", T.LongType(), True),
         T.StructField("resultado", T.StringType(), True),
         T.StructField("canal", T.StringType(), True),
-        T.StructField("fecha_gestion", T.StringType(), True),  # parse luego
+        T.StructField("fecha_gestion", T.StringType(), True),
     ]),
     "productos": T.StructType([
         T.StructField("product_id", T.LongType(), True),
@@ -137,26 +146,26 @@ schemas: Dict[str, T.StructType] = {
         T.StructField("customer_id", T.LongType(), True),
         T.StructField("debt_id", T.LongType(), True),
         T.StructField("monto_prometido", T.DoubleType(), True),
-        T.StructField("fecha_promesa", T.StringType(), True),  # parse luego
+        T.StructField("fecha_promesa", T.StringType(), True),
     ]),
 }
 
 
 # =========================
-# 1) Bronze -> Silver (Parquet)
+# 1) Bronze -> Silver
 # =========================
 clientes = read_csv_bronze("clientes", schemas["clientes"]) \
-    .withColumn("fecha_registro", F.to_date("fecha_registro"))
+    .withColumn("fecha_registro", to_date_multi("fecha_registro"))
 
 deuda = read_csv_bronze("deuda", schemas["deuda"]) \
-    .withColumn("fecha_vencimiento", F.to_date("fecha_vencimiento")) \
+    .withColumn("fecha_vencimiento", to_date_multi("fecha_vencimiento")) \
     .withColumn("estado", F.upper(F.trim(F.col("estado"))))
 
 pagos = read_csv_bronze("pagos", schemas["pagos"]) \
-    .withColumn("fecha_pago", F.to_date("fecha_pago"))
+    .withColumn("fecha_pago", to_date_multi("fecha_pago"))
 
 gestiones = read_csv_bronze("gestiones_cobranza", schemas["gestiones_cobranza"]) \
-    .withColumn("fecha_gestion", F.to_date("fecha_gestion")) \
+    .withColumn("fecha_gestion", to_date_multi("fecha_gestion")) \
     .withColumn("resultado", F.upper(F.trim(F.col("resultado")))) \
     .withColumn("canal", F.upper(F.trim(F.col("canal"))))
 
@@ -165,9 +174,9 @@ productos = read_csv_bronze("productos", schemas["productos"]) \
     .withColumn("producto", F.trim(F.col("producto")))
 
 promesas = read_csv_bronze("promesas_pago", schemas["promesas_pago"]) \
-    .withColumn("fecha_promesa", F.to_date("fecha_promesa"))
+    .withColumn("fecha_promesa", to_date_multi("fecha_promesa"))
 
-# Calidad mínima (evita basura)
+# Calidad mínima
 clientes = clientes.filter(F.col("customer_id").isNotNull())
 deuda = deuda.filter(F.col("debt_id").isNotNull() & F.col("customer_id").isNotNull())
 pagos = pagos.filter(F.col("payment_id").isNotNull() & F.col("customer_id").isNotNull())
@@ -187,7 +196,6 @@ write_parquet(promesas, f"{SILVER}/promesas_pago")
 # =========================
 # 2) Silver -> Gold (KPIs)
 # =========================
-# KPI por cliente: deuda total, pagado total, pendiente, tasa recuperación
 deuda_cli = deuda.groupBy("customer_id").agg(
     F.sum(F.col("monto_deuda")).alias("total_deuda"),
     F.countDistinct("debt_id").alias("num_deudas"),
@@ -212,7 +220,6 @@ kpi_cliente = (
     .withColumn("tasa_recuperacion", safe_div(F.col("total_pagado"), F.col("total_deuda")))
 )
 
-# KPI adicional: gestiones por cliente (conteo)
 gest_cli = gestiones.groupBy("customer_id").agg(
     F.count("*").alias("num_gestiones"),
     F.countDistinct("canal").alias("num_canales"),
@@ -226,46 +233,21 @@ kpi_cliente = (
     .withColumn("num_canales", F.coalesce(F.col("num_canales"), F.lit(0)))
 )
 
-# Write Gold (Parquet)
+# Write Gold
 write_parquet(kpi_cliente, f"{GOLD}/kpi_cliente")
 
-# También dejamos una vista agregada por categoría (opcional, útil para BI)
 deuda_prod = (
     deuda.join(productos, on="product_id", how="left")
     .groupBy("categoria")
     .agg(
         F.sum("monto_deuda").alias("total_deuda_categoria"),
-        F.countDistinct("debt_id").alias("num_deudas_categoria")
+        F.countDistinct("debt_id").alias("num_deudas_categoria"),
     )
 )
 write_parquet(deuda_prod, f"{GOLD}/kpi_deuda_categoria")
 
-
-# =========================
-# 3) Gold -> BigQuery (tabla kpi_cliente)
-# =========================
-# Tu workflow hace: SELECT * FROM `${PROJECT_ID}.${DATASET}.kpi_cliente`;
-# Así que aquí garantizamos que exista esa tabla.
-if not PROJECT_ID:
-    # Si por alguna razón no se detecta el project, lo intentamos vía Spark conf
-    PROJECT_ID = spark.sparkContext.getConf().get("spark.hadoop.fs.gs.project.id", "")
-
-if not PROJECT_ID:
-    print("WARNING: No se pudo inferir PROJECT_ID. Se intentará escribir a BigQuery usando el proyecto por defecto del runner.")
-
-bq_table = f"{PROJECT_ID}.{DATASET}.kpi_cliente" if PROJECT_ID else f"{DATASET}.kpi_cliente"
-
-(
-    kpi_cliente
-    .write
-    .format("bigquery")
-    .option("table", bq_table)
-    .option("temporaryGcsBucket", BUCKET)
-    .mode("overwrite")
-    .save()
-)
-
-print(f"OK: kpi_cliente escrito en BigQuery: {bq_table}")
-print(f"OK: Silver Parquet en {SILVER}/... y Gold Parquet en {GOLD}/...")
+print("OK: Silver Parquet escrito en:", SILVER)
+print("OK: Gold Parquet escrito en:", GOLD)
+print("Siguiente paso: el workflow crea/actualiza External Tables en BigQuery apuntando a GOLD (Parquet).")
 
 spark.stop()
