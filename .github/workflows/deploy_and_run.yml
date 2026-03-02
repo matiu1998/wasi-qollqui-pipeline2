@@ -1,0 +1,53 @@
+name: Deploy and Run Wasi Qollqui Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy-run:
+    runs-on: ubuntu-latest
+
+    env:
+      PROJECT_ID: project-53930c9b-4e21-4329-b74
+      REGION: us-central1
+      BUCKET: wasi-qollqui-lake-53930c9b
+      DATASET: wasi_qollqui
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP using OIDC
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: "projects/560480328565/locations/global/workloadIdentityPools/github-actions-pool/providers/github-actions-provider"
+          service_account: "github-actions-sa@project-53930c9b-4e21-4329-b74.iam.gserviceaccount.com"
+
+      - name: Setup gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Deploy Spark pipeline to Cloud Storage
+        run: |
+          gsutil cp src/pipeline_wasi_qollqui.py gs://${BUCKET}/code/pipeline_wasi_qollqui.py
+
+      - name: Run Dataproc Serverless batch
+        run: |
+          gcloud dataproc batches submit pyspark gs://${BUCKET}/code/pipeline_wasi_qollqui.py \
+            --region=${REGION} \
+            --version=2.2 \
+            --properties=spark.wasi.bucket=${BUCKET}
+
+      - name: Materialize BI table in BigQuery
+        run: |
+          bq --location=US query --use_legacy_sql=false "
+          CREATE OR REPLACE TABLE \`${PROJECT_ID}.${DATASET}.kpi_cliente_bi\` AS
+          SELECT * FROM \`${PROJECT_ID}.${DATASET}.kpi_cliente\`;
+          "
