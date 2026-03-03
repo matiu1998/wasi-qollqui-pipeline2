@@ -60,13 +60,24 @@ jobs:
             --service-account=${SA_EMAIL} \
             --properties=spark.wasi.bucket=${BUCKET},spark.wasi.project=${PROJECT_ID},spark.wasi.dataset=${DATASET},spark.wasi.bq_location=${BQ_LOCATION}
 
-      # 4) BIGQUERY: CREAR DATASET SI NO EXISTE
+            # 4) BIGQUERY: CREAR DATASET SI NO EXISTE
       - name: Create dataset if not exists
         run: |
           bq --location=${BQ_LOCATION} show ${PROJECT_ID}:${DATASET} >/dev/null 2>&1 || \
           bq --location=${BQ_LOCATION} mk --dataset ${PROJECT_ID}:${DATASET}
 
-      # 5) MATERIALIZAR TABLA BI
+      # 5) CREAR/REEMPLAZAR TABLA EXTERNA SOBRE GOLD PARQUET
+      - name: Create/Replace External Table kpi_cliente
+        run: |
+          bq --location=${BQ_LOCATION} query --use_legacy_sql=false "
+          CREATE OR REPLACE EXTERNAL TABLE \`${PROJECT_ID}.${DATASET}.kpi_cliente\`
+          OPTIONS (
+            format = 'PARQUET',
+            uris = ['gs://${BUCKET}/gold/parquet/kpi_cliente/*.parquet']
+          );
+          "
+
+      # 6) MATERIALIZAR TABLA BI (NATIVA) PARA POWER BI
       - name: Materialize BI table in BigQuery
         run: |
           bq --location=${BQ_LOCATION} query --use_legacy_sql=false "
