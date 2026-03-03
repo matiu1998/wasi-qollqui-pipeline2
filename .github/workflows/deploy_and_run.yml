@@ -1,86 +1,60 @@
-name: Deploy and Run Wasi Qollqui Pipeline
+name: Deploy to GCP (GCS jobs + Composer DAG)
 
 on:
-  workflow_dispatch: {}
   push:
-    branches: ["main"]
+    branches: [ "main" ]
+  workflow_dispatch:
 
-permissions:
-  contents: read
-  id-token: write
+env:
+  PROJECT_ID: project-53930c9b-4e21-4329-b74
+  REGION: us-central1
+
+  # Bucket del datalake (donde subimos el job pyspark)
+  DATALAKE_BUCKET: wasi-qollqui-datalake-2
+
+  # Bucket de Composer (DAGs)
+  COMPOSER_DAGS_PREFIX: gs://us-central1-composer-wasi-q-4f939bbf-bucket/dags
+
+  # Rutas en el repo
+  PYSPARK_SCRIPT_LOCAL: src/pipeline_wasi_qollqui.py
+  DAG_LOCAL: dags/wasi_qollqui_medallion_pipeline.py
+
+  # Rutas destino en GCS
+  PYSPARK_SCRIPT_GCS: gs://wasi-qollqui-datalake-2/jobs/pipeline_wasi_qollqui.py
 
 jobs:
-  deploy-run:
+  deploy:
     runs-on: ubuntu-latest
 
-    env:
-      PROJECT_ID: project-53930c9b-4e21-4329-b74
-      REGION: us-central1
-      BUCKET: wasi-qollqui-lake-53930c9b
-      DATASET: wasi_qollqui
-      SA_EMAIL: github-actions-sa@project-53930c9b-4e21-4329-b74.iam.gserviceaccount.com
-      BQ_LOCATION: us-central1
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Authenticate to GCP using OIDC
+      # AUTH: OIDC -> Workload Identity Federation
+      - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: projects/560480328565/locations/global/workloadIdentityPools/github-actions-pool/providers/github-actions-provider
-          service_account: github-actions-sa@project-53930c9b-4e21-4329-b74.iam.gserviceaccount.com
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
 
-      - name: Setup gcloud SDK
+      - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: ${{ env.PROJECT_ID }}
-          install_components: "bq"
 
-      # 1) SUBE CSV (bronze)
-      - name: Upload Bronze CSVs to Cloud Storage
-        run: |
-          gsutil -m cp data/*.csv gs://${BUCKET}/bronze/csv/
-          echo "Bronze files:"
-          gsutil ls gs://${BUCKET}/bronze/csv/
+      - name: gcloud set project
+        run: gcloud config set project "${PROJECT_ID}"
 
-      # 2) SUBE CÓDIGO
-      - name: Deploy Spark pipeline to Cloud Storage
+      # Subir el PySpark job a tu bucket /jobs/
+      - name: Upload PySpark script to GCS
         run: |
-          gsutil cp src/pipeline_wasi_qollqui.py gs://${BUCKET}/code/pipeline_wasi_qollqui.py
-          echo "Code files:"
-          gsutil ls gs://${BUCKET}/code/
+          gsutil cp "${PYSPARK_SCRIPT_LOCAL}" "${PYSPARK_SCRIPT_GCS}"
+          gsutil ls -l "${PYSPARK_SCRIPT_GCS}"
 
-      # 3) EJECUTA DATAPROC SERVERLESS
-      - name: Run Dataproc Serverless batch
+      # Subir/actualizar DAG al bucket de Composer
+      - name: Upload DAG to Composer
         run: |
-          gcloud dataproc batches submit pyspark gs://${BUCKET}/code/pipeline_wasi_qollqui.py \
-            --region=${REGION} \
-            --version=2.2 \
-            --service-account=${SA_EMAIL} \
-            --properties=spark.wasi.bucket=${BUCKET},spark.wasi.project=${PROJECT_ID},spark.wasi.dataset=${DATASET},spark.wasi.bq_location=${BQ_LOCATION}
-
-            # 4) BIGQUERY: CREAR DATASET SI NO EXISTE
-      - name: Create dataset if not exists
-        run: |
-          bq --location=${BQ_LOCATION} show ${PROJECT_ID}:${DATASET} >/dev/null 2>&1 || \
-          bq --location=${BQ_LOCATION} mk --dataset ${PROJECT_ID}:${DATASET}
-
-      # 5) CREAR/REEMPLAZAR TABLA EXTERNA SOBRE GOLD PARQUET
-      - name: Create/Replace External Table kpi_cliente
-        run: |
-          bq --location=${BQ_LOCATION} query --use_legacy_sql=false "
-          CREATE OR REPLACE EXTERNAL TABLE \`${PROJECT_ID}.${DATASET}.kpi_cliente\`
-          OPTIONS (
-            format = 'PARQUET',
-            uris = ['gs://${BUCKET}/gold/parquet/kpi_cliente/*.parquet']
-          );
-          "
-
-      # 6) MATERIALIZAR TABLA BI (NATIVA) PARA POWER BI
-      - name: Materialize BI table in BigQuery
-        run: |
-          bq --location=${BQ_LOCATION} query --use_legacy_sql=false "
-          CREATE OR REPLACE TABLE \`${PROJECT_ID}.${DATASET}.kpi_cliente_bi\` AS
-          SELECT * FROM \`${PROJECT_ID}.${DATASET}.kpi_cliente\`;
-          "
+          gsutil cp "${DAG_LOCAL}" "${COMPOSER_DAGS_PREFIX}/"
+          gsutil ls -l "${COMPOSER_DAGS_PREFIX}/"
