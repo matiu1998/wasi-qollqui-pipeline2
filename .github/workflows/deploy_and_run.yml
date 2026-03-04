@@ -3,39 +3,25 @@ name: Deploy to GCP (GCS jobs + Composer DAG)
 on:
   push:
     branches: [ "main" ]
-  workflow_dispatch:
-
-env:
-  PROJECT_ID: project-53930c9b-4e21-4329-b74
-  REGION: us-central1
-
-  # Bucket del datalake (donde subimos el job pyspark)
-  DATALAKE_BUCKET: wasi-qollqui-datalake-2
-
-  # Bucket de Composer (DAGs)
-  COMPOSER_DAGS_PREFIX: gs://us-central1-composer-wasi-q-4f939bbf-bucket/dags
-
-  # Rutas en el repo
-  PYSPARK_SCRIPT_LOCAL: src/pipeline_wasi_qollqui.py
-  DAG_LOCAL: dags/wasi_qollqui_medallion_pipeline.py
-
-  # Rutas destino en GCS
-  PYSPARK_SCRIPT_GCS: gs://wasi-qollqui-datalake-2/jobs/pipeline_wasi_qollqui.py
+  workflow_dispatch: {}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
-    permissions:
-      contents: read
-      id-token: write
+    env:
+      PROJECT_ID: project-53930c9b-4e21-4329-b74
+      REGION: us-central1
+      BUCKET: wasi-qollqui-datalake-2
+      COMPOSER_ENV: composer-wasi-qollqui
+      DAG_ID: wasi_qollqui_medallion_pipeline
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # AUTH: OIDC -> Workload Identity Federation
-      - name: Authenticate to Google Cloud
+      # Auth via Workload Identity Federation
+      - name: Auth to Google Cloud
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
@@ -43,18 +29,25 @@ jobs:
 
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
 
-      - name: gcloud set project
-        run: gcloud config set project "${PROJECT_ID}"
-
-      # Subir el PySpark job a tu bucket /jobs/
-      - name: Upload PySpark script to GCS
+      # 1) Subir el PySpark script a GCS (jobs/)
+      - name: Upload PySpark job to GCS
         run: |
-          gsutil cp "${PYSPARK_SCRIPT_LOCAL}" "${PYSPARK_SCRIPT_GCS}"
-          gsutil ls -l "${PYSPARK_SCRIPT_GCS}"
+          gsutil -m cp -r src/pipeline_wasi_qollqui.py gs://${BUCKET}/jobs/pipeline_wasi_qollqui.py
 
-      # Subir/actualizar DAG al bucket de Composer
+      # 2) Subir el DAG a Composer (bucket de DAGs)
       - name: Upload DAG to Composer
         run: |
-          gsutil cp "${DAG_LOCAL}" "${COMPOSER_DAGS_PREFIX}/"
-          gsutil ls -l "${COMPOSER_DAGS_PREFIX}/"
+          DAG_BUCKET=$(gcloud composer environments describe ${COMPOSER_ENV} \
+            --location ${REGION} \
+            --format="value(config.dagGcsPrefix)")
+          gsutil -m cp -r dags/${DAG_ID}.py ${DAG_BUCKET}/
+
+      # 3) ✅ Trigger del DAG
+      - name: Trigger Composer DAG
+        run: |
+          gcloud composer environments run ${COMPOSER_ENV} \
+            --location ${REGION} \
+            dags trigger -- ${DAG_ID}
